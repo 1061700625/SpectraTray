@@ -15,6 +15,12 @@
   - 版本号显示
 - ✅ 双击托盘图标打开网站（xfxuezhang.cn）
 
+
+> ​下载链接(github,推荐)：https://github.com/1061700625/SpectraTray/releases  
+> 下载链接(lanzou)：https://xfxuezhang.lanzouv.com/iDJoE3dryb3c
+
+​
+
 ## 环境要求
 
 - Windows 10/11
