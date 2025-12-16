@@ -18,18 +18,22 @@
 ## 环境要求
 
 - Windows 10/11
-- Python 3.8+（推荐 3.10+）
+- Python 3.8+
+
 
 ## 安装依赖
 
 ```bash
+conda create -n tray python=3.10
+conda activate tray
+
 pip install numpy pillow pystray SoundCard
 ```
 
 ## 运行
 
 ```bash
-python vol.py
+python app.py
 ```
 
 运行后会出现托盘图标，右键可切换背景色和灵敏度。
@@ -49,7 +53,7 @@ python vol.py
 
 ```bash
 pip install pyinstaller
-pyinstaller -F -w vol.py
+pyinstaller -F -w -i SpectraTray.ico --name SpectraTray app.py
 ```
 
 生成的可执行文件在 dist/ 目录。
