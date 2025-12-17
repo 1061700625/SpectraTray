@@ -1,5 +1,7 @@
 # SpectraTray（声谱托盘）
 
+<p align="center"><img src="https://github.com/user-attachments/assets/042bf821-21ff-4e63-b08c-f3b27b86502f" width="400"></p>
+
 一个运行在 Windows 系统托盘的实时“系统声音频谱”小工具：抓取系统正在播放的声音（Loopback），将频谱分成 8 个频段，用彩色柱状图在托盘图标里实时显示。
 
 - 网站：https://xfxuezhang.cn
