@@ -25,12 +25,11 @@ import threading
 import math
 import warnings
 import webbrowser
-
 import numpy as np
 import soundcard as sc
-
 from PIL import Image, ImageDraw
 import pystray
+import sys
 
 
 # =========================
@@ -206,6 +205,39 @@ def build_band_bins(sr, nfft, n_bands=8, fmin=80.0, fmax=16000.0):
             bins.append((int(idx[0]), int(idx[-1]) + 1))
     return bins
 
+def pick_recording_source(prefer_names=("BlackHole", "Loopback", "VB-Audio", "Soundflower")):
+    """
+    自动选择“能抓到系统输出”的录音源：
+    - Windows：默认扬声器 + include_loopback=True
+    - macOS：优先找 BlackHole/Loopback 等虚拟设备；找不到则退回默认麦克风
+    返回：(mic, hint_text)
+      mic: soundcard microphone object
+      hint_text: 用于提示用户的字符串（可能为空）
+    """
+    plat = sys.platform.lower()
+
+    # ---------- Windows：WASAPI loopback ----------
+    if plat.startswith("win"):
+        speaker = sc.default_speaker()
+        mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+        return mic, ""
+
+    # ---------- macOS：没有原生 loopback，只能靠虚拟声卡 ----------
+    if plat == "darwin":
+        mics = sc.all_microphones()
+        # 优先匹配虚拟设备
+        for key in prefer_names:
+            for m in mics:
+                if key.lower() in m.name.lower():
+                    return m, ""
+
+        # 找不到虚拟设备：退回默认麦克风，但给出提示
+        hint = "未检测到 BlackHole/Loopback 虚拟声卡，已退回默认麦克风（无法抓系统输出）"
+        return sc.default_microphone(), hint
+
+    # ---------- 其它平台：先简单退回默认麦克风 ----------
+    return sc.default_microphone(), "当前平台未实现系统输出抓取，已退回默认麦克风"
+
 
 # =========================
 # 主类：托盘图标 + 菜单 + 后台音频采集线程
@@ -257,6 +289,22 @@ class TraySpectrumMeter:
         self._last_primary_click = 0.0
         self._double_click_gap = 0.35  # 两次点击间隔阈值（秒）
 
+        # --------- 杂音滤除（仅影响显示）---------
+        self.denoise_enabled = False
+        self.denoise_strength_choices = [("弱", 0.8), ("中", 1.2), ("强", 1.8)]
+        self.denoise_alpha = 1.2
+        self._learn_noise = threading.Event()   # 触发学习噪声画像
+        self._noise_profile = None              # np.ndarray, 线性幅度谱（rfft 长度）
+        self._noise_band_db = None              # shape: (n_bands,)
+        self.denoise_gate_margin_db = 0.0         # 噪声门
+        # --------- 频段统计方式（Max / RMS / P90）---------
+        self.band_stat_choices = [
+            ("峰值 Max (更跳)", "max"),
+            ("能量 RMS (更稳)", "rms"),
+            ("分位数 P90 (抗尖峰)", "p90"),
+        ]
+        self.band_stat = "rms"  # 默认 RMS
+
         # -------------------------
         # 创建托盘图标对象
         # -------------------------
@@ -295,6 +343,32 @@ class TraySpectrumMeter:
         with self._lock:
             self.bg_mode = str(mode)
         self._force_redraw.set()
+
+    def get_denoise_enabled(self):
+        with self._lock:
+            return bool(self.denoise_enabled)
+
+    def _set_denoise_enabled(self, v):
+        with self._lock: self.denoise_enabled = bool(v)
+        self._force_redraw.set()
+
+    def get_denoise_alpha(self):
+        with self._lock:
+            return float(self.denoise_alpha)
+
+    def _set_denoise_alpha(self, a):
+        with self._lock: self.denoise_alpha = float(a)
+        self._force_redraw.set()
+
+    def get_band_stat(self):
+        with self._lock:
+            return str(self.band_stat)
+
+    def _set_band_stat(self, mode):
+        with self._lock:
+            self.band_stat = str(mode)
+        self._force_redraw.set()
+
 
     # ---------- 打开网站 / 双击逻辑 ----------
 
@@ -378,12 +452,66 @@ class TraySpectrumMeter:
                 default=True,
                 visible=False
             ))
+        
+        # ---- 杂音滤除开关 ----
+        def checked_denoise(item):
+            return self.get_denoise_enabled()
+
+        def action_toggle_denoise(icon, item):
+            self._set_denoise_enabled(not self.get_denoise_enabled())
+
+        # ---- 学习噪声画像 ----
+        def action_learn_noise(icon, item):
+            self._learn_noise.set()
+
+        # ---- 强度子菜单 ----
+        def checked_alpha(a):
+            def _checked(item):
+                return abs(self.get_denoise_alpha() - a) < 1e-9
+            return _checked
+
+        def action_alpha(a):
+            def _act(icon, item):
+                self._set_denoise_alpha(a)
+            return _act
+
+        denoise_strength_menu = pystray.Menu(
+            *[
+                pystray.MenuItem(name, action_alpha(a), checked=checked_alpha(a))
+                for (name, a) in self.denoise_strength_choices
+            ]
+        ) 
+
+        denoise_menu = pystray.Menu(
+            pystray.MenuItem("开启过滤", action_toggle_denoise, checked=checked_denoise),
+            pystray.MenuItem("学习噪声（3秒）", action_learn_noise),
+            pystray.MenuItem("过滤强度", denoise_strength_menu),
+            
+        )
+
+        # ---- 频段统计方式子菜单（放到“杂音滤除”里）----
+        def checked_stat(mode):
+            def _checked(item): return self.get_band_stat() == mode
+            return _checked
+
+        def action_stat(mode):
+            def _act(icon, item): self._set_band_stat(mode)
+            return _act
+
+        stat_menu = pystray.Menu(
+            *[
+                pystray.MenuItem(name, action_stat(mode), checked=checked_stat(mode))
+                for (name, mode) in self.band_stat_choices
+            ]
+        )
 
         # 右键菜单主项
         items += [
             pystray.MenuItem("打开官网", self._on_open_website_menu),
             pystray.MenuItem("背景色", bg_menu),
             pystray.MenuItem("灵敏度", sens_menu),
+            pystray.MenuItem("频段统计", stat_menu),
+            pystray.MenuItem("杂音滤除", denoise_menu),
             pystray.Menu.SEPARATOR,
             # 版本号只显示，不可点击
             pystray.MenuItem(f"版本：{__version__}", lambda icon, item: None, enabled=False),
@@ -421,10 +549,17 @@ class TraySpectrumMeter:
         except Exception:
             warnings.filterwarnings("ignore", message="data discontinuity in recording")
 
-        # 获取默认扬声器（输出设备）
-        speaker = sc.default_speaker()
-        # 获取对应 loopback 录音源（把扬声器输出当成输入）
-        mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+        # # 获取默认扬声器（输出设备）
+        # speaker = sc.default_speaker()
+        # # 获取对应 loopback 录音源（把扬声器输出当成输入）
+        # mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+        mic, hint = pick_recording_source()
+        if hint:
+            try:
+                self.icon.title = f"{APP_NAME} v{__version__}  |  {hint}"
+                self.icon.update_menu()  # 部分后端不需要，但加上也无妨
+            except Exception:
+                pass
 
         sr = self.samplerate
         nfft = self.nfft
@@ -444,6 +579,7 @@ class TraySpectrumMeter:
             last_levels = None
             last_db_range = None
             last_bg_mode = None
+            last_stat_mode = None
 
             while not self._stop.is_set():
                 # 阻塞读取 nfft 帧（刷新间隔约为 nfft / sr）
@@ -460,13 +596,42 @@ class TraySpectrumMeter:
                 # 幅度谱（取复数模）
                 mag = np.abs(X).astype(np.float32)
 
+                # ---------- 学习噪声画像 ----------
+                if self._learn_noise.is_set():
+                    self._learn_noise.clear()
+                    learn_frames = max(12, int(3 * sr / nfft))
+                    buf = []
+                    for _ in range(learn_frames):
+                        if self._stop.is_set(): break
+                        data2 = rec.record(numframes=nfft)
+                        if data2 is None or data2.size == 0:
+                            continue
+                        x2 = data2.mean(axis=1).astype(np.float32)
+                        X2 = np.fft.rfft(x2 * window)
+                        mag2 = np.abs(X2).astype(np.float32)
+                        mag2_db = 20.0 * np.log10(mag2 + 1e-8)
+                        band_db_list = []
+                        for (a, b) in bins:
+                            if b <= a:
+                                band_db_list.append(-120.0)
+                            else:
+                                # 用 percentile 代替 max，抗“偶发尖峰”
+                                band_db_list.append(float(np.percentile(mag2_db[a:b], 90)))
+                        buf.append(band_db_list)
+                    if buf:
+                        noise_band = np.median(np.array(buf, dtype=np.float32), axis=0)  # 每段中位数作为噪声底
+                        with self._lock:
+                            self._noise_band_db = noise_band
+                        self._force_redraw.set()
+
                 # 转换到 dB：20*log10(A)
                 mag_db = 20.0 * np.log10(mag + 1e-8)
 
-                # 读取当前设置（线程安全）
+                # 读取当前设置
                 db_range = self.get_db_range()
                 bg_mode = self.get_bg_mode()
                 max_level = self.get_max_level()
+                stat_mode = self.get_band_stat()
 
                 # 计算 8 个频段的档位
                 levels = []
@@ -475,8 +640,34 @@ class TraySpectrumMeter:
                         # 该频段没 bin，认为极小
                         band_db = -120.0
                     else:
-                        # 取最大值：更突出瞬态（尤其高频鼓点/齿音会更“跳”）
-                        band_db = float(np.max(mag_db[a:b]))
+                        seg = mag_db[a:b]
+                        ## 取最大值,更突出瞬态,尤其高频鼓点/齿音会更“跳”
+                        if stat_mode == "max":
+                            band_db = float(np.max(seg))
+                        ## 用 90% 分位数, 更抗尖峰
+                        elif stat_mode == "p90":
+                            band_db = float(np.percentile(seg, 90))
+                        ## 用 RMS,更接近能量
+                        elif stat_mode == "rms":
+                            amp = 10.0 ** (seg / 20.0)
+                            band_db = float(20.0 * np.log10(np.sqrt(np.mean(amp * amp)) + 1e-12))
+                        else:
+                            raise ValueError(f"Unknown stat mode: {stat_mode}")
+
+                        ## 应用滤噪, 每段做“功率域减法”再回到 dB
+                        if self.get_denoise_enabled():
+                            with self._lock:
+                                nb = self._noise_band_db
+                            if nb is not None:
+                                # 功率域减法：Pclean = max(P - alpha*N, eps)
+                                alpha = self.get_denoise_alpha()
+                                P = 10.0 ** (band_db / 10.0)
+                                N = 10.0 ** (float(nb[i]) / 10.0)
+                                Pclean = max(P - alpha * N, 1e-12)
+                                band_db = 10.0 * math.log10(Pclean)
+                                if band_db < float(nb[i]) + self.denoise_gate_margin_db:
+                                    band_db = -120.0  # 直接压到极低，柱子就不亮
+
 
                     # 峰值跟踪：峰值逐渐下降，但遇到更高值会立刻抬升
                     band_peak_db[i] = max(band_db, band_peak_db[i] - self.peak_decay_db)
@@ -498,10 +689,14 @@ class TraySpectrumMeter:
                     last_levels = None
                     last_db_range = None
                     last_bg_mode = None
+                    last_stat_mode = None
                     self._force_redraw.clear()
 
                 # 仅当显示内容变化时更新托盘图标
-                if (levels != last_levels) or (db_range != last_db_range) or (bg_mode != last_bg_mode):
+                if  (levels != last_levels) or \
+                    (db_range != last_db_range) or \
+                    (bg_mode != last_bg_mode) or \
+                    (stat_mode != last_stat_mode):
                     self.icon.icon = make_spectrum_icon(levels, max_level, bg_mode, ICON_SIZE)
                     try:
                         self.icon.update_icon()
@@ -512,9 +707,9 @@ class TraySpectrumMeter:
                     last_levels = list(levels)
                     last_db_range = db_range
                     last_bg_mode = bg_mode
+                    last_stat_mode = stat_mode
 
     # ---------- 启动 ----------
-
     def run(self):
         """启动后台线程，并进入托盘事件循环。"""
         threading.Thread(target=self._worker, daemon=True).start()
