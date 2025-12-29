@@ -90,7 +90,8 @@ pyinstaller -F -w -i SpectraTray.ico --name SpectraTray app.py
 生成的可执行文件在 dist/ 目录。
 
 ## 打包成 app
-可用 py2app。
+### 使用 py2app
+> 需要Apple Develop ID，不太推荐。
 
 1、生成配置文件。
 
@@ -151,5 +152,87 @@ codesign --force --deep --sign - dist/SpectraTray.app
 ```
 生成的可执行文件在 dist/ 目录。
 
+
+### 使用Swift
+> 不需要Apple Develop ID，推荐！
+
+1、创建原生启动器 App。
+```bash
+mkdir -p SpectraTray.app/Contents/{MacOS,Resources}
+mkdir -p SpectraTray.app/Contents/Resources/pysrc
+cp app.py SpectraTray.app/Contents/Resources/pysrc/
+cp -R venv SpectraTray.app/Contents/Resources/venv
+cp SpectraTray.ico SpectraTray.app/Contents/Resources/
+```
+
+2、写 Swift 启动器。
+```bash
+cat > main.swift <<'SWIFT'
+import Foundation
+import AVFoundation
+
+func runPython() {
+    let bundleURL = Bundle.main.bundleURL
+    let py = bundleURL.appendingPathComponent("Contents/Resources/venv/bin/python3").path
+    let script = bundleURL.appendingPathComponent("Contents/Resources/pysrc/app.py").path
+
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: py)
+    task.arguments = [script]
+
+    // 完全后台（不弹终端）
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError  = FileHandle.nullDevice
+
+    do { try task.run() } catch { }
+
+    exit(0)
+}
+
+// 先触发一次麦克风权限（允许后 python 才能录到 BlackHole）
+AVCaptureDevice.requestAccess(for: .audio) { _ in
+    runPython()
+}
+
+RunLoop.main.run()
+SWIFT
+
+swiftc main.swift -o SpectraTray.app/Contents/MacOS/SpectraTray
+```
+
+3、写 Info.plist。
+```bash
+cat > SpectraTray.app/Contents/Info.plist <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>SpectraTray</string>
+  <key>CFBundleDisplayName</key><string>SpectraTray</string>
+  <key>CFBundleIdentifier</key><string>local.spectratray</string>
+  <key>CFBundleExecutable</key><string>SpectraTray</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.0.2</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleIconFile</key><string>SpectraTray.ico</string>
+  <key>LSBackgroundOnly</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>用于捕获系统音频（如 BlackHole）并显示实时频谱</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+</dict>
+</plist>
+PLIST
+```
+
+4、去掉 quarantine。
+```bash
+xattr -dr com.apple.quarantine SpectraTray.app
+```
+
+5、刷新图标。
+```bash
+touch SpectraTray.app
+```
+
+6、启动 SpectraTray.app
 
 
