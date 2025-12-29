@@ -43,7 +43,7 @@ pip install numpy pillow pystray SoundCard
 pip install -i https://pypi.org/simple pystray pillow numpy SoundCard pyobjc
 ```
 
-> 对于MacOS，可以安装[BlackHole](https://existential.audio/blackhole/)来只抓系统声音，从而避免通过麦克风收音：
+> 对于MacOS，可以安装[BlackHole 2ch](https://existential.audio/blackhole/)或[BlackHole 16ch](https://www.filmagepro.com/downloads/BlackHole.pkg)来只抓系统声音，从而避免通过麦克风收音([教程](https://obsproject.com/forum/resources/mac-desktop-audio-using-blackhole.1191/))：
 > 
 > 1、安装blackhole：
 > ```bash
@@ -55,7 +55,7 @@ pip install -i https://pypi.org/simple pystray pillow numpy SoundCard pyobjc
 > 3、点左下角 + → 创建多输出设备
 > 
 > 4、勾选：  
-> - 真实扬声器 / 耳机  
+> - MacBook扬声器 (注意得排第一个) 
 > - BlackHole 2ch
 > 
 > 5、右击，选择“将此设备用于声音输出”
@@ -79,11 +79,77 @@ python app.py
 如果播放器使用了独占模式（例如某些 WASAPI Exclusive/ASIO），可能会绕开系统混音，导致 Loopback 取不到数据。请关闭独占模式或改用普通输出模式。
 
 ## 打包成 EXE
-可用 PyInstaller：  
+可用 PyInstaller。
 
 ```bash
 pip install pyinstaller
+
 pyinstaller -F -w -i SpectraTray.ico --name SpectraTray app.py
 ```
 
 生成的可执行文件在 dist/ 目录。
+
+## 打包成 app
+可用 py2app。
+
+1、生成配置文件。
+
+```bash
+py2applet --make-setup app.py
+```
+
+2、编辑setup.py。
+
+```python
+from setuptools import setup
+
+APP = ["app.py"]
+
+OPTIONS = {
+    # 托盘程序不需要终端窗口
+    "argv_emulation": False,
+
+    "iconfile": "SpectraTray.ico",
+
+    # 关键：定制 Info.plist（官方文档：Tweaking your Info.plist）
+    "plist": {
+        "CFBundleName": "SpectraTray",
+        "CFBundleDisplayName": "SpectraTray",
+        "CFBundleIdentifier": "com.xfxuezhang.spectratray",
+
+        # 托盘应用常用：不在 Dock 显示图标（仅菜单栏/托盘）
+        "LSUIElement": True,
+
+        # 麦克风用途说明：没有它 macOS 可能不会弹权限窗/直接拒绝
+        "NSMicrophoneUsageDescription": "用于采集音频以显示频谱（不保存、不上传）。",
+    },
+}
+
+setup(
+    app=APP,
+    options={"py2app": OPTIONS},
+    setup_requires=["py2app"],
+)
+```
+
+3、继续执行。
+
+```bash
+rm -rf build dist
+
+python setup.py py2app                      
+
+/usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string 用于采集 音频以显示频谱（不保存、不上传）"  dist/SpectraTray.app/Contents/Info.plist
+
+mkdir -p dist/SpectraTray.app/Contents/Frameworks/
+
+cp /opt/homebrew/opt/libffi/lib/libffi.8.dylib dist/SpectraTray.app/Contents/Frameworks/
+
+install_name_tool -id @rpath/libffi.8.dylib dist/SpectraTray.app/Contents/Frameworks/libffi.8.dylib
+
+codesign --force --deep --sign - dist/SpectraTray.app
+```
+生成的可执行文件在 dist/ 目录。
+
+
+
