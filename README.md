@@ -26,17 +26,39 @@
 ## 环境要求
 
 - Windows 10/11
+- MacOS
 - Python 3.8+
 
 
 ## 安装依赖
 
 ```bash
-conda create -n tray python=3.10
+conda create -n tray python=3.10 -y
 conda activate tray
 
+# For windows
 pip install numpy pillow pystray SoundCard
+
+# For macos
+pip install -i https://pypi.org/simple pystray pillow numpy SoundCard pyobjc
 ```
+
+> 对于MacOS，可以安装[BlackHole](https://existential.audio/blackhole/)来只抓系统声音，从而避免通过麦克风收音：
+> 
+> 1、安装blackhole：
+> ```bash
+> brew install blackhole-2ch
+> ```
+> 
+> 2、打开 音频 MIDI 设置
+> 
+> 3、点左下角 + → 创建多输出设备
+> 
+> 4、勾选：  
+> - 真实扬声器 / 耳机  
+> - BlackHole 2ch
+> 
+> 5、右击，选择“将此设备用于声音输出”
 
 ## 运行
 
