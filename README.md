@@ -43,7 +43,7 @@ pip install numpy pillow pystray SoundCard
 pip install -i https://pypi.org/simple pystray pillow numpy SoundCard pyobjc
 ```
 
-> 对于MacOS，可以安装[BlackHole 2ch](https://existential.audio/blackhole/)或[BlackHole 16ch](https://www.filmagepro.com/downloads/BlackHole.pkg)来只抓系统声音，从而避免通过麦克风收音([教程](https://obsproject.com/forum/resources/mac-desktop-audio-using-blackhole.1191/))：
+> 对于MacOS，可以安装[BlackHole 2ch](https://existential.audio/blackhole/)或[BlackHole 16ch](https://www.filmagepro.com/downloads/BlackHole.pkg)来只抓系统声音，从而避免通过麦克风收音含噪音([教程](https://obsproject.com/forum/resources/mac-desktop-audio-using-blackhole.1191/))：
 > 
 > 1、安装blackhole：
 > ```bash
@@ -156,12 +156,19 @@ codesign --force --deep --sign - dist/SpectraTray.app
 ### 使用Swift
 > 不需要Apple Develop ID，推荐！
 
+0、准备干净的环境。
+```bash
+python -m venv tray
+source tray/bin/activate
+pip install -i https://pypi.org/simple pystray pillow numpy SoundCard pyobjc
+```
+
 1、创建原生启动器 App。
 ```bash
 mkdir -p SpectraTray.app/Contents/{MacOS,Resources}
 mkdir -p SpectraTray.app/Contents/Resources/pysrc
 cp app.py SpectraTray.app/Contents/Resources/pysrc/
-cp -R venv SpectraTray.app/Contents/Resources/venv
+cp -R tray SpectraTray.app/Contents/Resources/tray
 cp SpectraTray.ico SpectraTray.app/Contents/Resources/
 ```
 
@@ -173,7 +180,7 @@ import AVFoundation
 
 func runPython() {
     let bundleURL = Bundle.main.bundleURL
-    let py = bundleURL.appendingPathComponent("Contents/Resources/venv/bin/python3").path
+    let py = bundleURL.appendingPathComponent("Contents/Resources/tray/bin/python3").path
     let script = bundleURL.appendingPathComponent("Contents/Resources/pysrc/app.py").path
 
     let task = Process()
