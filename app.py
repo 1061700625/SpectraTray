@@ -20,6 +20,7 @@ SpectraTray（声谱托盘）
 - 退出
 """
 
+import os
 import time
 import threading
 import math
@@ -30,6 +31,8 @@ import soundcard as sc
 from PIL import Image, ImageDraw
 import pystray
 import sys
+import requests
+from tkinter import messagebox
 # 屏蔽 soundcard 的 discontinuity 警告（通常不影响视觉显示）
 try:
     from soundcard.mediafoundation import SoundcardRuntimeWarning
@@ -46,17 +49,18 @@ except Exception:
 APP_NAME_CN = "声谱托盘"
 APP_NAME_EN = "SpectraTray"
 APP_NAME = f"{APP_NAME_CN} / {APP_NAME_EN}"
-
 # 版本号（用于菜单显示/托盘标题）
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
+# 启动时版本检查
+VERSION_CHECK_URL = "https://raw.githubusercontent.com/1061700625/SpectraTray/refs/heads/main/assets/version"
+RELEASES_URL = "https://github.com/1061700625/SpectraTray/releases"
+UPDATE_CHECK_TIMEOUT = 3.0  # 秒：避免网络卡住太久
 # 双击托盘图标后打开的网页
 WEBSITE_URL = "https://github.com/1061700625/SpectraTray"
-
 # 托盘图标绘制尺寸（最终系统可能会缩放到 16/24/32 之类显示）
 ICON_SIZE = 64
-
-# 8 个频段的配色（低频 -> 高频），刻意避开“纯绿”以减少看不清的问题
+# 8 个频段的配色（低频 -> 高频）
 BAND_COLORS = [
     (255,  70,  70),  # 红
     (255, 150,  60),  # 橙
@@ -65,7 +69,7 @@ BAND_COLORS = [
     (205,  90, 255),  # 紫
     (120, 120, 255),  # 靛
     ( 80, 170, 255),  # 蓝
-    ( 70, 235, 255),  # 青（偏蓝青）
+    ( 70, 235, 255),  # 青
 ]
 
 
@@ -76,6 +80,36 @@ BAND_COLORS = [
 def clamp(x, a, b):
     """把 x 限制在 [a, b]，防止出现越界值。"""
     return a if x < a else (b if x > b else x)
+
+def _parse_version(v: str):
+    # "0.0.12" -> (0,0,12)；遇到非数字后缀就尽量取数字部分
+    parts = []
+    for p in (v or "").strip().split("."):
+        try:
+            parts.append(int(p))
+        except Exception:
+            num = "".join(ch for ch in p if ch.isdigit())
+            parts.append(int(num) if num else 0)
+    return tuple(parts)
+
+def check_update():
+    try:
+        r = requests.get(
+            VERSION_CHECK_URL,
+            timeout=UPDATE_CHECK_TIMEOUT
+        )
+        if r.status_code != 200: return
+        server_v = (r.text or "").strip().splitlines()[0].strip()
+        if server_v and (_parse_version(server_v) > _parse_version(__version__)):
+            title = f"{APP_NAME_EN} 更新"
+            msg = f"发现新版本：{server_v}\n当前版本：{__version__}\n\n是否前往发布页下载更新？"
+            if messagebox.askyesno(title=title, message=msg):
+                try:
+                    webbrowser.open_new_tab(RELEASES_URL)
+                finally:
+                    os._exit(0)
+    except Exception:
+        pass
 
 
 # =========================
@@ -858,4 +892,5 @@ class TraySpectrumMeter:
 
 # 程序入口
 if __name__ == "__main__":
+    check_update()
     TraySpectrumMeter(default_levels=10).run()
