@@ -156,11 +156,13 @@ codesign --force --deep --sign - dist/SpectraTray.app
 ### 使用Swift
 > 不需要Apple Develop ID，推荐！
 
+> fast cmd: `chmod +x pack_macos.sh && ./pack_macos.sh`
+
 0、准备干净的环境。
 ```bash
 python -m venv tray
 source tray/bin/activate
-pip install -i https://pypi.org/simple pystray pillow numpy SoundCard pyobjc
+pip install -i https://pypi.org/simple pystray pillow numpy SoundCard pyobjc requests
 ```
 
 1、创建原生启动器 App。
