@@ -30,6 +30,12 @@ import soundcard as sc
 from PIL import Image, ImageDraw
 import pystray
 import sys
+# 屏蔽 soundcard 的 discontinuity 警告（通常不影响视觉显示）
+try:
+    from soundcard.mediafoundation import SoundcardRuntimeWarning
+    warnings.filterwarnings("ignore", category=SoundcardRuntimeWarning)
+except Exception:
+    warnings.filterwarnings("ignore", message="data discontinuity in recording")
 
 
 # =========================
@@ -42,7 +48,7 @@ APP_NAME_EN = "SpectraTray"
 APP_NAME = f"{APP_NAME_CN} / {APP_NAME_EN}"
 
 # 版本号（用于菜单显示/托盘标题）
-__version__ = "0.0.1"
+__version__ = "0.0.3"
 
 # 双击托盘图标后打开的网页
 WEBSITE_URL = "https://github.com/1061700625/SpectraTray"
@@ -306,6 +312,19 @@ class TraySpectrumMeter:
         self.band_stat = "rms"  # 默认 RMS
 
         # -------------------------
+        # 输入源选择（右键菜单可切换）
+        # -------------------------
+        # 说明：
+        # - 默认选择“默认麦克风”（满足你的需求）
+        # - Windows 下额外提供“系统输出（默认扬声器 Loopback）”，用于抓系统正在播放的声音
+        # - 其它平台若没有虚拟声卡（如 BlackHole/Loopback），也可以从设备列表里手动选
+        self.input_source_key = "default_mic"
+        self._restart_audio = threading.Event()   # 输入源切换后让 worker 重新打开录音器
+        self._mic_key_to_name = {}                # mic#i -> mic.name
+        self._input_source_choices = []           # List[(label, key)]
+        self._refresh_input_source_choices()
+
+        # -------------------------
         # 创建托盘图标对象
         # -------------------------
         self.icon = pystray.Icon(
@@ -368,6 +387,102 @@ class TraySpectrumMeter:
         with self._lock:
             self.band_stat = str(mode)
         self._force_redraw.set()
+
+    # ---------- 输入源选择----------
+    def get_input_source_key(self):
+        """读取当前输入源 key（线程安全）。"""
+        with self._lock:
+            return str(self.input_source_key)
+
+    def _set_input_source_key(self, key):
+        """设置输入源 key，并通知 worker 重新打开录音器（线程安全）。"""
+        with self._lock:
+            self.input_source_key = str(key)
+        self._restart_audio.set()
+        self._force_redraw.set()
+
+    def get_input_source_choices(self):
+        """读取输入源列表（线程安全）。返回 List[(label, key)]。"""
+        with self._lock:
+            return list(self._input_source_choices)
+
+    def _refresh_input_source_choices(self):
+        """
+        枚举可用输入设备，生成右键菜单的候选项。
+
+        - 永远包含：默认麦克风
+        - Windows 额外包含：系统输出（默认扬声器 Loopback）
+        - 设备列表：soundcard.all_microphones() 的结果
+        """
+        choices = [("默认麦克风", "default_mic")]
+
+        plat = sys.platform.lower()
+        if plat.startswith("win"):
+            choices.append(("系统输出（默认扬声器 Loopback）", "loopback_default_speaker"))
+
+        mic_map = {}
+        try:
+            default_mic_name = sc.default_microphone().name
+        except Exception:
+            default_mic_name = None
+
+        try:
+            mics = sc.all_microphones()
+        except Exception:
+            mics = []
+
+        # 把所有麦克风都列出来，避免“默认麦克风”不是你想要的那个设备
+        for i, m in enumerate(mics):
+            key = f"mic#{i}"
+            mic_map[key] = m.name
+
+            # 右键菜单显示名：对默认设备做个标记，方便识别
+            label = m.name
+            if default_mic_name and m.name == default_mic_name:
+                label = f"{m.name}(系统默认)"
+
+            choices.append((label, key))
+
+        with self._lock:
+            self._mic_key_to_name = mic_map
+            self._input_source_choices = choices
+
+    def _resolve_microphone(self, key):
+        """
+        根据输入源 key 解析 soundcard 的麦克风对象。
+        返回：(mic, label, hint)
+        """
+        plat = sys.platform.lower()
+
+        # --- 默认麦克风 ---
+        if key == "default_mic":
+            return sc.default_microphone(), "默认麦克风", ""
+
+        # --- Windows：默认扬声器 loopback ---
+        if key == "loopback_default_speaker":
+            if plat.startswith("win"):
+                speaker = sc.default_speaker()
+                mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+                return mic, f"系统输出（{speaker.name} Loopback）", ""
+            # 其它平台没有原生 loopback
+            return sc.default_microphone(), "默认麦克风", "当前平台不支持扬声器 Loopback，已退回默认麦克风"
+
+        # --- 指定麦克风设备 ---
+        if key.startswith("mic#"):
+            with self._lock:
+                name = self._mic_key_to_name.get(key)
+
+            if name:
+                try:
+                    for m in sc.all_microphones():
+                        if m.name == name:
+                            return m, name, ""
+                except Exception:
+                    pass
+                return sc.default_microphone(), "默认麦克风", f"未找到设备：{name}，已退回默认麦克风"
+
+        # --- 兜底 ---
+        return sc.default_microphone(), "默认麦克风", "未知输入源，已退回默认麦克风"
 
 
     # ---------- 打开网站 / 双击逻辑 ----------
@@ -504,12 +619,29 @@ class TraySpectrumMeter:
                 for (name, mode) in self.band_stat_choices
             ]
         )
+        
+        # ---- 输入源子菜单 ----
+        def checked_input(k):
+            def _checked(item):
+                return self.get_input_source_key() == k
+            return _checked
+
+        def action_input(k):
+            def _act(icon, item):
+                self._set_input_source_key(k)
+            return _act
+
+        input_menu = pystray.Menu(
+            *[pystray.MenuItem(name, action_input(k), checked=checked_input(k))
+            for (name, k) in self.get_input_source_choices()]
+        )
 
         # 右键菜单主项
         items += [
             pystray.MenuItem("打开官网", self._on_open_website_menu),
             pystray.MenuItem("背景色", bg_menu),
             pystray.MenuItem("灵敏度", sens_menu),
+            pystray.MenuItem("切换音源", input_menu),
             pystray.MenuItem("频段统计", stat_menu),
             pystray.MenuItem("杂音滤除", denoise_menu),
             pystray.Menu.SEPARATOR,
@@ -533,34 +665,13 @@ class TraySpectrumMeter:
         """
         后台线程主循环：
 
-        1) 通过 soundcard 的 loopback 抓系统回放音频
+        1) 根据右键菜单选择的“输入源”打开录音器（默认：默认麦克风）
+           - Windows 额外支持“系统输出（默认扬声器 Loopback）”
         2) 每次读 nfft 帧 -> 窗函数 -> rfft -> 幅度 -> 转 dB
-        3) 按频段 bins 切片，取每段的最大值 band_db（更突出瞬态/高音）
-        4) 做峰值跟踪 band_peak_db：
-           - 峰值每帧下降 peak_decay_db（模拟“参考峰值线”慢慢往下掉）
-           - 当前 band_db 若更大则立即抬升峰值
-        5) 以 (band_peak_db - db_range) 为底，以 band_peak_db 为顶，把 band_db 映射到 0..1，再映射到 0..max_level
-        6) 若参数/levels 变化则重绘托盘图标
+        3) 按频段 bins 切片，按统计方式（Max/RMS/P90）计算每段 band_db
+        4) 峰值跟踪 + 动态范围(db_range) 归一化 -> 0..max_level
+        5) 若参数/levels 变化则重绘托盘图标
         """
-        # 屏蔽 soundcard 的 discontinuity 警告（通常不影响视觉显示）
-        try:
-            from soundcard.mediafoundation import SoundcardRuntimeWarning
-            warnings.filterwarnings("ignore", category=SoundcardRuntimeWarning)
-        except Exception:
-            warnings.filterwarnings("ignore", message="data discontinuity in recording")
-
-        # # 获取默认扬声器（输出设备）
-        # speaker = sc.default_speaker()
-        # # 获取对应 loopback 录音源（把扬声器输出当成输入）
-        # mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-        mic, hint = pick_recording_source()
-        if hint:
-            try:
-                self.icon.title = f"{APP_NAME} v{__version__}  |  {hint}"
-                self.icon.update_menu()  # 部分后端不需要，但加上也无妨
-            except Exception:
-                pass
-
         sr = self.samplerate
         nfft = self.nfft
 
@@ -570,144 +681,173 @@ class TraySpectrumMeter:
         # 汉宁窗：减少频谱泄漏（让频谱更干净）
         window = np.hanning(nfft).astype(np.float32)
 
-        # 每个频段的峰值跟踪值（dB）
-        band_peak_db = np.full(self.n_bands, -30.0, dtype=np.float32)
+        # 录音器外层循环：支持右键菜单切换输入源
+        while not self._stop.is_set():
+            key = self.get_input_source_key()
 
-        # 打开录音器（双声道录制，后面会混成 mono）
-        with mic.recorder(samplerate=sr, channels=2) as rec:
-            # 用于“变化检测”，避免每帧都更新图标（省 CPU）
-            last_levels = None
-            last_db_range = None
-            last_bg_mode = None
-            last_stat_mode = None
+            # 解析输入源
+            try:
+                mic, label, hint = self._resolve_microphone(key)
+            except Exception as e:
+                mic, label, hint = sc.default_microphone(), "默认麦克风", f"打开输入源失败，已退回默认麦克风：{e}"
 
-            while not self._stop.is_set():
-                # 阻塞读取 nfft 帧（刷新间隔约为 nfft / sr）
-                data = rec.record(numframes=nfft)
-                if data is None or data.size == 0:
-                    continue
+            # 更新托盘提示文本
+            try:
+                title = f"{APP_NAME} v{__version__}  |  输入：{label}"
+                if hint:
+                    title += f"  |  {hint}"
+                self.icon.title = title
+                self.icon.update_menu()
+            except Exception:
+                pass
 
-                # 双声道 -> 单声道（取平均）
-                x = data.mean(axis=1).astype(np.float32)
+            # 每次切换输入源都重置峰值跟踪
+            band_peak_db = np.full(self.n_bands, -30.0, dtype=np.float32)
 
-                # FFT：只计算正频率部分（rfft）
-                X = np.fft.rfft(x * window)
+            # 清除切换标志，准备打开录音器
+            self._restart_audio.clear()
 
-                # 幅度谱（取复数模）
-                mag = np.abs(X).astype(np.float32)
-
-                # ---------- 学习噪声画像 ----------
-                if self._learn_noise.is_set():
-                    self._learn_noise.clear()
-                    learn_frames = max(12, int(3 * sr / nfft))
-                    buf = []
-                    for _ in range(learn_frames):
-                        if self._stop.is_set(): break
-                        data2 = rec.record(numframes=nfft)
-                        if data2 is None or data2.size == 0:
-                            continue
-                        x2 = data2.mean(axis=1).astype(np.float32)
-                        X2 = np.fft.rfft(x2 * window)
-                        mag2 = np.abs(X2).astype(np.float32)
-                        mag2_db = 20.0 * np.log10(mag2 + 1e-8)
-                        band_db_list = []
-                        for (a, b) in bins:
-                            if b <= a:
-                                band_db_list.append(-120.0)
-                            else:
-                                # 用 percentile 代替 max，抗“偶发尖峰”
-                                band_db_list.append(float(np.percentile(mag2_db[a:b], 90)))
-                        buf.append(band_db_list)
-                    if buf:
-                        noise_band = np.median(np.array(buf, dtype=np.float32), axis=0)  # 每段中位数作为噪声底
-                        with self._lock:
-                            self._noise_band_db = noise_band
-                        self._force_redraw.set()
-
-                # 转换到 dB：20*log10(A)
-                mag_db = 20.0 * np.log10(mag + 1e-8)
-
-                # 读取当前设置
-                db_range = self.get_db_range()
-                bg_mode = self.get_bg_mode()
-                max_level = self.get_max_level()
-                stat_mode = self.get_band_stat()
-
-                # 计算 8 个频段的档位
-                levels = []
-                for i, (a, b) in enumerate(bins):
-                    if b <= a:
-                        # 该频段没 bin，认为极小
-                        band_db = -120.0
-                    else:
-                        seg = mag_db[a:b]
-                        ## 取最大值,更突出瞬态,尤其高频鼓点/齿音会更“跳”
-                        if stat_mode == "max":
-                            band_db = float(np.max(seg))
-                        ## 用 90% 分位数, 更抗尖峰
-                        elif stat_mode == "p90":
-                            band_db = float(np.percentile(seg, 90))
-                        ## 用 RMS,更接近能量
-                        elif stat_mode == "rms":
-                            amp = 10.0 ** (seg / 20.0)
-                            band_db = float(20.0 * np.log10(np.sqrt(np.mean(amp * amp)) + 1e-12))
-                        else:
-                            raise ValueError(f"Unknown stat mode: {stat_mode}")
-
-                        ## 应用滤噪, 每段做“功率域减法”再回到 dB
-                        if self.get_denoise_enabled():
-                            with self._lock:
-                                nb = self._noise_band_db
-                            if nb is not None:
-                                # 功率域减法：Pclean = max(P - alpha*N, eps)
-                                alpha = self.get_denoise_alpha()
-                                P = 10.0 ** (band_db / 10.0)
-                                N = 10.0 ** (float(nb[i]) / 10.0)
-                                Pclean = max(P - alpha * N, 1e-12)
-                                band_db = 10.0 * math.log10(Pclean)
-                                if band_db < float(nb[i]) + self.denoise_gate_margin_db:
-                                    band_db = -120.0  # 直接压到极低，柱子就不亮
-
-
-                    # 峰值跟踪：峰值逐渐下降，但遇到更高值会立刻抬升
-                    band_peak_db[i] = max(band_db, band_peak_db[i] - self.peak_decay_db)
-
-                    # 归一化：
-                    # - floor = 峰值 - db_range
-                    # - band_db == floor -> 0
-                    # - band_db == peak  -> 1
-                    floor = float(band_peak_db[i] - db_range)
-                    t = (band_db - floor) / db_range
-                    t = clamp(t, 0.0, 1.0)
-
-                    # 0..1 映射为 0..max_level
-                    lv = int(round(t * max_level))
-                    levels.append(clamp(lv, 0, max_level))
-
-                # 菜单改动后强制重绘
-                if self._force_redraw.is_set():
+            # 打开录音器（双声道录制，后面会混成 mono）
+            try:
+                with mic.recorder(samplerate=sr, channels=2) as rec:
+                    # 用于“变化检测”，避免每帧都更新图标（省 CPU）
                     last_levels = None
                     last_db_range = None
                     last_bg_mode = None
                     last_stat_mode = None
-                    self._force_redraw.clear()
 
-                # 仅当显示内容变化时更新托盘图标
-                if  (levels != last_levels) or \
-                    (db_range != last_db_range) or \
-                    (bg_mode != last_bg_mode) or \
-                    (stat_mode != last_stat_mode):
-                    self.icon.icon = make_spectrum_icon(levels, max_level, bg_mode, ICON_SIZE)
-                    try:
-                        self.icon.update_icon()
-                    except Exception:
-                        # 某些后端下更新可能抛异常，忽略即可
-                        pass
+                    while not self._stop.is_set():
+                        # 输入源切换：跳出当前录音器，外层会重新打开
+                        if self._restart_audio.is_set():
+                            self._restart_audio.clear()
+                            break
 
-                    last_levels = list(levels)
-                    last_db_range = db_range
-                    last_bg_mode = bg_mode
-                    last_stat_mode = stat_mode
+                        # 阻塞读取 nfft 帧（刷新间隔约为 nfft / sr）
+                        data = rec.record(numframes=nfft)
+                        if data is None or data.size == 0:
+                            continue
+
+                        # 双声道 -> 单声道（取平均）
+                        x = data.mean(axis=1).astype(np.float32)
+
+                        # FFT：只计算正频率部分（rfft）
+                        X = np.fft.rfft(x * window)
+
+                        # 幅度谱（取复数模）
+                        mag = np.abs(X).astype(np.float32)
+
+                        # ---------- 学习噪声画像 ----------
+                        if self._learn_noise.is_set():
+                            self._learn_noise.clear()
+                            learn_frames = max(12, int(3 * sr / nfft))
+                            buf = []
+                            for _ in range(learn_frames):
+                                if self._stop.is_set() or self._restart_audio.is_set():
+                                    break
+                                data2 = rec.record(numframes=nfft)
+                                if data2 is None or data2.size == 0:
+                                    continue
+                                x2 = data2.mean(axis=1).astype(np.float32)
+                                X2 = np.fft.rfft(x2 * window)
+                                mag2 = np.abs(X2).astype(np.float32)
+                                mag2_db = 20.0 * np.log10(mag2 + 1e-8)
+                                band_db_list = []
+                                for (a, b) in bins:
+                                    if b <= a:
+                                        band_db_list.append(-120.0)
+                                    else:
+                                        # 用 percentile 代替 max，抗“偶发尖峰”
+                                        band_db_list.append(float(np.percentile(mag2_db[a:b], 90)))
+                                buf.append(band_db_list)
+                            if buf:
+                                noise_band = np.median(np.array(buf, dtype=np.float32), axis=0)  # 每段中位数作为噪声底
+                                with self._lock:
+                                    self._noise_band_db = noise_band
+                                self._force_redraw.set()
+
+                        # 转换到 dB：20*log10(A)
+                        mag_db = 20.0 * np.log10(mag + 1e-8)
+
+                        # 读取当前设置
+                        db_range = self.get_db_range()
+                        bg_mode = self.get_bg_mode()
+                        max_level = self.get_max_level()
+                        stat_mode = self.get_band_stat()
+
+                        # 计算 8 个频段的档位
+                        levels = []
+                        for i, (a, b) in enumerate(bins):
+                            if b <= a:
+                                # 该频段没 bin，认为极小
+                                band_db = -120.0
+                            else:
+                                seg = mag_db[a:b]
+                                # 取统计量
+                                if stat_mode == "max":
+                                    band_db = float(np.max(seg))
+                                elif stat_mode == "p90":
+                                    band_db = float(np.percentile(seg, 90))
+                                elif stat_mode == "rms":
+                                    amp = 10.0 ** (seg / 20.0)
+                                    band_db = float(20.0 * np.log10(np.sqrt(np.mean(amp * amp)) + 1e-12))
+                                else:
+                                    raise ValueError(f"Unknown stat mode: {stat_mode}")
+
+                                # 应用滤噪：每段做“功率域减法”再回到 dB
+                                if self.get_denoise_enabled():
+                                    with self._lock:
+                                        nb = self._noise_band_db
+                                    if nb is not None:
+                                        alpha = self.get_denoise_alpha()
+                                        P = 10.0 ** (band_db / 10.0)
+                                        N = 10.0 ** (float(nb[i]) / 10.0)
+                                        Pclean = max(P - alpha * N, 1e-12)
+                                        band_db = 10.0 * math.log10(Pclean)
+                                        if band_db < float(nb[i]) + self.denoise_gate_margin_db:
+                                            band_db = -120.0  # 直接压到极低，柱子就不亮
+
+                            # 峰值跟踪：峰值逐渐下降，但遇到更高值会立刻抬升
+                            band_peak_db[i] = max(band_db, band_peak_db[i] - self.peak_decay_db)
+
+                            # 归一化
+                            floor = float(band_peak_db[i] - db_range)
+                            t = (band_db - floor) / db_range
+                            t = clamp(t, 0.0, 1.0)
+
+                            # 0..1 映射为 0..max_level
+                            lv = int(round(t * max_level))
+                            levels.append(clamp(lv, 0, max_level))
+
+                        # 菜单改动后强制重绘
+                        if self._force_redraw.is_set():
+                            last_levels = None
+                            last_db_range = None
+                            last_bg_mode = None
+                            last_stat_mode = None
+                            self._force_redraw.clear()
+
+                        # 仅当显示内容变化时更新托盘图标
+                        if  (levels != last_levels) or \
+                            (db_range != last_db_range) or \
+                            (bg_mode != last_bg_mode) or \
+                            (stat_mode != last_stat_mode):
+                            self.icon.icon = make_spectrum_icon(levels, max_level, bg_mode, ICON_SIZE)
+                            try:
+                                self.icon.update_icon()
+                            except Exception:
+                                pass
+
+                            last_levels = list(levels)
+                            last_db_range = db_range
+                            last_bg_mode = bg_mode
+                            last_stat_mode = stat_mode
+
+            except Exception:
+                # 设备被占用/无权限/切换瞬间可能会失败：稍等后重试
+                time.sleep(0.4)
+                if self.get_input_source_key() != "default_mic":
+                    self._set_input_source_key("default_mic")
+                continue
 
     # ---------- 启动 ----------
     def run(self):
